@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2022, Frappe Technologies Pvt. Ltd. and contributors
 # For license information, please see license.txt
 
@@ -307,6 +308,19 @@ class SiteDB(FrappeDB):
 
     def create_engine(self, credentials):
         """Create SQLAlchemy engine with given credentials"""
+        # Connect to the site's own database exactly as Frappe does
+        # (frappe.database.mariadb.database.get_connection_settings): verified TLS with the
+        # configured CA when db_ssl_ca is set, a plain connection otherwise. Passing
+        # ssl_verify_cert alone made PyMySQL demand TLS verified against the system CA bundle,
+        # which a MariaDB server's self-signed certificate (offered by default since 11.4) fails.
+        tls = {}
+        if frappe.conf.db_ssl_ca:
+            tls = {
+                "ssl_ca": frappe.conf.db_ssl_ca,
+                "ssl_check_hostname": bool(frappe.conf.db_ssl_check_hostname),
+            }
+            if frappe.conf.db_ssl_cert and frappe.conf.db_ssl_key:
+                tls.update(ssl_cert=frappe.conf.db_ssl_cert, ssl_key=frappe.conf.db_ssl_key)
         return get_sqlalchemy_engine(
             dialect="mysql",
             driver="pymysql",
@@ -315,10 +329,9 @@ class SiteDB(FrappeDB):
             database=credentials["database"],
             host=credentials["host"],
             port=credentials["port"],
-            ssl=False,
-            ssl_verify_cert=bool(not frappe.conf.developer_mode),
             charset="utf8mb4",
             use_unicode=True,
+            **tls,
         )
 
 
