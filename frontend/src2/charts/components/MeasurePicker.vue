@@ -20,7 +20,14 @@ const emit = defineEmits({ remove: () => true })
 const props = defineProps<{
 	label?: string
 	columnOptions: ColumnOption[]
+	enableFormat?: boolean
 }>()
+
+const formatOptions = [
+	{ label: __('Normal'), value: '' },
+	{ label: __('Percent'), value: 'percent' },
+	{ label: __('Currency'), value: 'currency' },
+]
 
 // True when at least one available column is a pre-aggregated measure (i.e. it
 // came from a summarize/pivot_wider step in the source query). In this case we
@@ -128,6 +135,7 @@ function updateMeasure(measureExpression: ExpressionMeasure) {
 		expression: measureExpression.expression,
 		measure_name: measureExpression.measure_name,
 		data_type: measureExpression.data_type,
+		format: measure.value.format,
 	}
 	showMeasureDialog.value = false
 }
@@ -160,6 +168,14 @@ const filteredColumnOptions = computed(() => {
 
 	return columnOptions.value.filter((option) => option.label.toLowerCase().includes(query))
 })
+
+// a currency code is text, so only text columns are offered
+const currencyColumnOptions = computed(() => [
+	{ label: __('Site currency'), value: '' },
+	...props.columnOptions
+		.filter((column) => FIELDTYPES.TEXT.includes(column.data_type))
+		.map((column) => ({ label: column.label, value: column.value })),
+])
 
 function getAggregationLabel(aggregation: AggregationType) {
 	return aggregationOptions.find((option) => option.value === aggregation)?.label
@@ -343,6 +359,27 @@ function handleRemove() {
 							@update:modelValue="label = $event"
 							@blur="measure.measure_name = label"
 							@keydown.enter="measure.measure_name = label"
+						/>
+					</InlineFormControlLabel>
+
+					<InlineFormControlLabel v-if="props.enableFormat" label="Format">
+						<FormControl
+							type="select"
+							:options="formatOptions"
+							:modelValue="measure.format || ''"
+							@update:modelValue="measure.format = $event || undefined"
+						/>
+					</InlineFormControlLabel>
+
+					<InlineFormControlLabel
+						v-if="props.enableFormat && measure.format === 'currency'"
+						:label="__('Currency from')"
+					>
+						<FormControl
+							type="select"
+							:options="currencyColumnOptions"
+							:modelValue="measure.currency_column || ''"
+							@update:modelValue="measure.currency_column = $event || undefined"
 						/>
 					</InlineFormControlLabel>
 

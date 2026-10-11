@@ -4,8 +4,9 @@ import { Button, LoadingIndicator } from 'frappe-ui'
 import { Plus, Search, Table2Icon } from 'lucide-vue-next'
 import { computed, nextTick, ref } from 'vue'
 import { usePagination } from '../composables/usePagination'
-import { createHeaders, formatNumber, getShortNumber } from '../helpers'
+import { createHeaders, formatNumber, getFormatUnits, getShortNumber } from '../helpers'
 import { FIELDTYPES } from '../helpers/constants'
+import { getRowCurrency } from '../query/helpers'
 import {
 	applyDateRule,
 	applyRankRule,
@@ -21,7 +22,13 @@ import {
 	text_rules,
 } from '../query/components/formatting_utils'
 import { matchesFilter, parseFilterString } from '../query/helpers'
-import { QueryResultColumn, QueryResultRow, SortDirection, SortOrder } from '../types/query.types'
+import {
+	DataFormat,
+	QueryResultColumn,
+	QueryResultRow,
+	SortDirection,
+	SortOrder,
+} from '../types/query.types'
 import DataTableColumn from './DataTableColumn.vue'
 import DataTableFooter from './DataTableFooter.vue'
 import LazyTextInput from './LazyTextInput.vue'
@@ -49,7 +56,9 @@ const props = defineProps<{
 	stickyColumns?: string[]
 	columnWidths?: Record<string, number>
 	textWrap?: Record<string, boolean>
+	columnFormats?: Record<string, DataFormat>
 	pageSize?: number
+	displayPageSize?: number
 	totalRowCount?: number
 	onPageChange?: (page: number) => void
 	currentPage?: number
@@ -216,6 +225,7 @@ const totalColumnTotal = computed(() => {
 
 const pagination = usePagination({
 	pageSize: computed(() => props.pageSize ?? 100),
+	displayPageSize: computed(() => props.displayPageSize ?? 100),
 	rowCount: computed(() => visibleRows.value?.length ?? 0),
 	totalRowCount: computed(() => props.totalRowCount),
 	currentPage: computed(() => props.currentPage),
@@ -515,12 +525,34 @@ function getCellStyleClass(colName: string, val: any): string {
 	return ''
 }
 
-function _formatNumber(value: any) {
+// a total over rows in different currencies is an amount in none, so it prints bare
+const currencyPerColumn = computed(() => {
+	const codes: Record<string, string | null | undefined> = {}
+	const rows = visibleRows.value || []
+	for (const [name, format] of Object.entries(props.columnFormats || {})) {
+		if (format !== 'currency') continue
+		const seen = new Set(rows.map((row) => getRowCurrency(row, name)))
+		codes[name] = seen.size === 1 ? [...seen][0] : null
+	}
+	return codes
+})
+
+function _formatNumber(value: any, columnName?: string, row?: any) {
 	const isNull = value === null || value === undefined
 	if (isNull) {
 		return props.replaceNullsWithZeros ? 0 : 'null'
 	}
-	return props.compactNumbers ? getShortNumber(value) : formatNumber(value)
+	const { scale, prefix, suffix } = getFormatUnits(
+		columnName ? props.columnFormats?.[columnName] : undefined,
+		columnName
+			? row
+				? getRowCurrency(row, columnName)
+				: currencyPerColumn.value[columnName]
+			: undefined,
+	)
+	const scaled = value * scale
+	const printed = props.compactNumbers ? getShortNumber(scaled) : formatNumber(scaled)
+	return `${prefix}${printed}${suffix}`
 }
 
 const showNewColumn = ref(false)
@@ -711,7 +743,7 @@ function toggleNewColumn() {
 							@dblclick="isNumberColumn(col.name) && props.onDrilldown?.(col, row)"
 						>
 							<template v-if="isNumberColumn(col.name)">
-								{{ _formatNumber(row[col.name]) }}
+								{{ _formatNumber(row[col.name], col.name, row) }}
 							</template>
 							<template v-else-if="isUrl(row[col.name])">
 								<a :href="row[col.name]" target="_blank" class="underline">
@@ -753,7 +785,7 @@ function toggleNewColumn() {
 						>
 							{{
 								isNumberColumn(col.name)
-									? _formatNumber(totalPerColumn[col.name])
+									? _formatNumber(totalPerColumn[col.name], col.name)
 									: ''
 							}}
 						</td>

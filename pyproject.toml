@@ -12,7 +12,7 @@ dependencies = [
     "SQLAlchemy==2.0.41",
     "python-telegram-bot==21.4",
     "duckdb~=1.4.3",
-    "sqlglot<28.0.0",
+    "sqlglot>=30.12.0,<30.18",
     "ibis-framework~=11.0.0",
     "ibis-framework[duckdb]",
     "ibis-framework[mysql]",
@@ -21,7 +21,11 @@ dependencies = [
     "ibis-framework[postgres]",
     # "ibis-framework[mssql]",
     # "ibis-framework[bigquery]",
+    "psycopg[binary]",
 ]
+
+[tool.bench.frappe-dependencies]
+frappe = ">=15.0.0"
 
 [project.optional-dependencies]
 test = [

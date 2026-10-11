@@ -5,11 +5,19 @@
 import frappe
 import frappe.utils
 from frappe.model.document import Document
+from frappe.model.naming import getseries
 from frappe.query_builder import Interval
 from frappe.query_builder.functions import Now
-from frappe.utils.telemetry import capture
 
+from insights.insights.query_utils import referenced_queries
+from insights.telemetry import capture
 from insights.utils import deep_convert_dict_to_dict
+
+# `tabSeries` key the workbook counter lives under.
+WORKBOOK_SERIES_KEY = "Insights Workbook"
+
+# Where an open came from, as `docs/telemetry.md` names them.
+OPEN_VIA = {"list", "recent", "desk", "link"}
 
 
 class InsightsWorkbook(Document):
@@ -22,12 +30,25 @@ class InsightsWorkbook(Document):
         from frappe.types import DF
 
         data_backup: DF.JSON | None
-        name: DF.Int | None
+        from_template: DF.Data | None
+        imported_checksum: DF.Data | None
+        imported_version: DF.Int
         title: DF.Data
     # end: auto-generated types
 
+    def before_naming(self):
+        # a fixture or export written while this doctype was still `autoincrement` carries a
+        # numeric name, and the column is varchar now — `validate_name` throws on an int
+        if isinstance(self.name, int):
+            self.name = str(self.name)
+
+    def autoname(self):
+        # plain numbers, carrying on from where `autoincrement` left off — see
+        # insights/patches/name_workbooks_as_strings.py for why this needs to be a string.
+        self.name = getseries(WORKBOOK_SERIES_KEY, 1)
+
     def before_save(self):
-        self.title = self.title or f"Workbook {frappe.utils.cint(self.name)}"
+        self.title = self.title or f"Workbook {self.name}"
 
     def on_trash(self):
         try:
@@ -46,7 +67,7 @@ class InsightsWorkbook(Document):
             frappe.delete_doc("Insights Folder", f.name, force=True, ignore_permissions=True)
 
     def after_insert(self):
-        capture("workbook_created", "insights")
+        capture("workbook_created", from_template=bool(self.from_template))
 
         # If this is a restored workbook (has data_backup) then restore child documents
         if not self.data_backup:
@@ -81,12 +102,14 @@ class InsightsWorkbook(Document):
             new_folder.insert(ignore_permissions=ignore_permissions)
             id_map[old_folder_name] = new_folder.name
 
+        queries = workbook_data.get("dependencies", {}).get("queries", {})
         query_sort_order = 0
-        for name, query in workbook_data.get("dependencies", {}).get("queries", {}).items():
-            query = deep_convert_dict_to_dict(query)
+        for name in _order_by_reference(queries):
+            query = deep_convert_dict_to_dict(queries[name])
             new_query = frappe.new_doc("Insights Query v3")
             new_query.update(query)
             new_query.workbook = target_workbook_name
+            new_query.operations = _rewrite_query_references(query.get("operations"), id_map)
 
             if query.get("folder") and query.get("folder") in id_map:
                 new_query.folder = id_map[query.get("folder")]
@@ -97,27 +120,6 @@ class InsightsWorkbook(Document):
 
             new_query.insert(ignore_permissions=ignore_permissions)
             id_map[name] = new_query.name
-
-        for name, _ in workbook_data.get("dependencies", {}).get("queries", {}).items():
-            new_query = frappe.get_doc("Insights Query v3", id_map[name])
-            operations = deep_convert_dict_to_dict(frappe.parse_json(new_query.operations))
-
-            should_update = False
-            for op in operations:
-                if (
-                    not op.get("table")
-                    or not op.get("table").get("type")
-                    or not op.get("table").get("query_name")
-                ):
-                    continue
-
-                ref_query = op.table.query_name
-                if ref_query in id_map:
-                    op.table.query_name = id_map[ref_query]
-                    should_update = True
-
-            if should_update:
-                new_query.db_set("operations", frappe.as_json(operations))
 
         chart_sort_order = 0
         for name, chart in workbook_data.get("dependencies", {}).get("charts", {}).items():
@@ -235,7 +237,7 @@ class InsightsWorkbook(Document):
         return d
 
     @frappe.whitelist()
-    def track_view(self):
+    def track_view(self, via: str | None = None):
         view_log = frappe.qb.DocType("View Log")
         last_viewed_recently = frappe.db.get_value(
             view_log,
@@ -249,6 +251,12 @@ class InsightsWorkbook(Document):
         )
         if not last_viewed_recently:
             self.add_viewed(force=True)
+
+        capture("workbook_opened", interval="1d", via=via if via in OPEN_VIA else "link")
+
+        # adoption signal for library workbooks; interval dedupes to once/user/site/day
+        if self.from_template:
+            capture("workbook_template_used", interval="1d", template=self.from_template)
 
     @frappe.whitelist()
     def export(self):
@@ -462,13 +470,56 @@ class InsightsWorkbook(Document):
         }
 
 
-def import_workbook(workbook):
+def _order_by_reference(queries: dict) -> list[str]:
+    """The names in `queries`, each one after the queries in the file it references.
+
+    A query is inserted with its references already pointing at the copies they
+    name, so those copies have to exist first. References form a directed acyclic
+    graph, so such an order exists. A file with no such order carries a cycle.
+    """
+    deps = {
+        name: referenced_queries(query.get("operations")) & queries.keys() for name, query in queries.items()
+    }
+
+    ordered = []
+    placed = set()
+    while len(placed) < len(deps):
+        ready = [name for name, refs in deps.items() if name not in placed and refs <= placed]
+        if not ready:
+            frappe.throw(
+                frappe._("Circular query reference detected in {0}").format(
+                    ", ".join(name for name in deps if name not in placed)
+                )
+            )
+        ordered.extend(ready)
+        placed.update(ready)
+
+    return ordered
+
+
+def _rewrite_query_references(operations, id_map: dict) -> str:
+    """Point every reference in `operations` at the copy that replaces it.
+
+    A name the file does not carry belongs to a query already on this site, and
+    is left alone: the import references that one, and read access decides.
+    """
+    operations = deep_convert_dict_to_dict(frappe.parse_json(operations) or [])
+    for op in operations:
+        table = op.get("table") or {}
+        if table.get("type") == "query" and table.get("query_name") in id_map:
+            table["query_name"] = id_map[table["query_name"]]
+
+    return frappe.as_json(operations)
+
+
+def import_workbook(workbook, from_template: str | None = None):
     workbook = frappe.parse_json(workbook)
     workbook = deep_convert_dict_to_dict(workbook)
 
     # Create a new Insights Workbook
     new_workbook = frappe.new_doc("Insights Workbook")
     new_workbook.title = workbook["doc"]["title"]
+    new_workbook.from_template = from_template
     new_workbook.insert()
     new_workbook.restore_workbook_contents(
         workbook,

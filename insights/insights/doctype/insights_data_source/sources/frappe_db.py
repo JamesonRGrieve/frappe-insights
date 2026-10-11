@@ -14,7 +14,7 @@ from insights.insights.query_builders.sql_builder import SQLQueryBuilder
 
 from .base_database import DatabaseCredentialsError, DatabaseParallelConnectionError
 from .mariadb import MARIADB_TO_GENERIC_TYPES, MariaDB
-from .utils import create_insights_table, get_sqlalchemy_engine
+from .utils import CONNECT_TIMEOUT, create_insights_table, get_sqlalchemy_engine
 
 
 class FrappeTableFactory:
@@ -200,6 +200,33 @@ class FrappeTableFactory:
         return dynamic_link_map
 
 
+def get_site_db_ssl_params():
+    """SSL settings for the site database, as the framework resolves them.
+
+    The site database has no connection fields in the form, so the site config
+    is the only source. This mirrors frappe.database.mariadb.
+
+    frappe.db.get_connection_settings() cannot be reused as is. It carries a
+    converter map, and other keys, built for the driver the framework itself
+    connects with, which is not always the one used here.
+    """
+    if not frappe.conf.db_ssl_ca:
+        return {}
+
+    # pymysql rebuilds its ssl options from scratch when ssl_verify_cert is set,
+    # which drops the CA. Sending the CA alone already means "verify".
+    params = {
+        "ssl_ca": frappe.conf.db_ssl_ca,
+        # a string, so that "do not check the hostname" survives the query
+        # string, where a falsy value would be dropped
+        "ssl_check_hostname": str(bool(frappe.conf.db_ssl_check_hostname)).lower(),
+    }
+    if frappe.conf.db_ssl_cert and frappe.conf.db_ssl_key:
+        params["ssl_cert"] = frappe.conf.db_ssl_cert
+        params["ssl_key"] = frappe.conf.db_ssl_key
+    return params
+
+
 class FrappeDB(MariaDB):
     def __init__(self, data_source, host, port, username, password, database_name, use_ssl, **_):
         self.data_source = data_source
@@ -212,10 +239,13 @@ class FrappeDB(MariaDB):
             host=host,
             port=port,
             ssl=use_ssl,
-            ssl_verify_cert=True,
+            ssl_verify_cert=use_ssl,
             charset="utf8mb4",
             use_unicode=True,
-            connect_args={"connect_timeout": 1, "read_timeout": 1, "write_timeout": 1},
+            # no read or write timeout: a chart query may well run longer than
+            # the connect timeout, and cutting a read mid packet leaves the
+            # connection out of step
+            connect_args={"connect_timeout": CONNECT_TIMEOUT},
         )
         self.query_builder: SQLQueryBuilder = SQLQueryBuilder(self.engine)
         self.table_factory: FrappeTableFactory = FrappeTableFactory(data_source)
@@ -287,6 +317,8 @@ class SiteDB(FrappeDB):
             primary_config["port"] = frappe.conf.replica_db_port
         if frappe.conf.replica_host:
             primary_config["host"] = frappe.conf.replica_host
+            # the primary's socket does not reach the replica
+            primary_config["socket"] = None
 
         if frappe.conf.different_credentials_for_replica:
             primary_config["username"] = (
@@ -297,30 +329,25 @@ class SiteDB(FrappeDB):
         return primary_config
 
     def get_primary_credentials(self):
-        """Get primary database credentials"""
+        """Read back what the framework itself connected with.
+
+        Reading the live connection, rather than resolving the site config a
+        second time, keeps the two in step across framework versions. v15
+        connects as db_name, later versions prefer db_user, and a site may be
+        reached over a socket rather than a host and port.
+        """
+        db = frappe.local.db
         return {
-            "username": frappe.conf.db_name,
-            "password": frappe.conf.db_password,
-            "database": frappe.conf.db_name,
-            "host": frappe.conf.db_host or "127.0.0.1",
-            "port": frappe.conf.db_port or "3306",
+            "username": db.user,
+            "password": db.password,
+            "database": db.cur_db_name,
+            "host": db.host or "127.0.0.1",
+            "port": db.port or "3306",
+            "socket": db.socket,
         }
 
     def create_engine(self, credentials):
         """Create SQLAlchemy engine with given credentials"""
-        # Connect to the site's own database exactly as Frappe does
-        # (frappe.database.mariadb.database.get_connection_settings): verified TLS with the
-        # configured CA when db_ssl_ca is set, a plain connection otherwise. Passing
-        # ssl_verify_cert alone made PyMySQL demand TLS verified against the system CA bundle,
-        # which a MariaDB server's self-signed certificate (offered by default since 11.4) fails.
-        tls = {}
-        if frappe.conf.db_ssl_ca:
-            tls = {
-                "ssl_ca": frappe.conf.db_ssl_ca,
-                "ssl_check_hostname": bool(frappe.conf.db_ssl_check_hostname),
-            }
-            if frappe.conf.db_ssl_cert and frappe.conf.db_ssl_key:
-                tls.update(ssl_cert=frappe.conf.db_ssl_cert, ssl_key=frappe.conf.db_ssl_key)
         return get_sqlalchemy_engine(
             dialect="mysql",
             driver="pymysql",
@@ -329,9 +356,10 @@ class SiteDB(FrappeDB):
             database=credentials["database"],
             host=credentials["host"],
             port=credentials["port"],
+            unix_socket=credentials.get("socket"),
             charset="utf8mb4",
             use_unicode=True,
-            **tls,
+            **get_site_db_ssl_params(),
         )
 
 
