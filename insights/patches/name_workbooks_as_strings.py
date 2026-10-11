@@ -24,6 +24,11 @@ def execute():
     if not frappe.db.table_exists("Insights Workbook"):
         return
 
+    # A table without its DocType record (the record arrives with this release's model
+    # sync) has no naming rule to move off; the sync imports the new one directly.
+    if not frappe.db.exists("DocType", "Insights Workbook"):
+        return
+
     if "bigint" not in str(frappe.db.get_column_type("Insights Workbook", "name")).lower():
         return
 
